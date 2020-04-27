@@ -115,8 +115,66 @@ class COCOeval:
             self._gts[gt['image_id'], gt['category_id']].append(gt)
         for dt in dts:
             self._dts[dt['image_id'], dt['category_id']].append(dt)
+
+        # Nikhil
+        print("GTS=============")
+        print(self._gts)
+        print("DTS=============")
+        print(self._dts)
+
         self.evalImgs = defaultdict(list)   # per-image per-category evaluation results
         self.eval     = {}                  # accumulated evaluation results
+
+
+    def my_evaluate(self):
+        '''
+        Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
+        :return: None
+        '''
+        tic = time.time()
+        print('[NIKHIL] Running per image evaluation...')
+        p = self.params
+        # add backward compatibility if useSegm is specified in params
+        if not p.useSegm is None:
+            p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
+            print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
+        print('Evaluate annotation type *{}*'.format(p.iouType))
+        p.imgIds = list(np.unique(p.imgIds))
+        if p.useCats:
+            p.catIds = list(np.unique(p.catIds))
+        p.maxDets = sorted(p.maxDets)
+        p.confs = sorted(p.confs)
+        self.params=p
+
+        self._prepare()
+        # loop through images, area range, max detection number
+        catIds = p.catIds if p.useCats else [-1]
+
+        if p.iouType == 'segm' or p.iouType == 'bbox':
+            computeIoU = self.computeIoU
+        elif p.iouType == 'keypoints':
+            computeIoU = self.computeOks
+        self.ious = {(imgId, catId): computeIoU(imgId, catId) \
+                        for imgId in p.imgIds
+                        for catId in catIds}
+
+        print("IOUs============")
+        print(self.ious)
+
+        evaluateImg = self.my_evaluateImg
+        maxDet = p.maxDets[-1]
+        self.evalImgs = [evaluateImg(imgId, catId)
+                 for catId in catIds
+                 for imgId in p.imgIds
+             ]
+
+        print("EvalImgs============")
+        print(self.evalImgs)
+
+        self._paramsEval = copy.deepcopy(self.params)
+        toc = time.time()
+        print('[NIKHIL] DONE (t={:0.2f}s).'.format(toc-tic))
+
 
     def evaluate(self):
         '''
@@ -312,6 +370,175 @@ class COCOeval:
                 'dtIgnore':     dtIg,
             }
 
+    def my_evaluateImg(self, imgId, catId):
+        '''
+        perform evaluation for single category and image
+        :return: dict (single image results)
+        '''
+        p = self.params
+        if p.useCats:
+            gt = self._gts[imgId,catId]
+            dt = self._dts[imgId,catId]
+        else:
+            gt = [_ for cId in p.catIds for _ in self._gts[imgId,cId]]
+            dt = [_ for cId in p.catIds for _ in self._dts[imgId,cId]]
+        if len(gt) == 0 and len(dt) ==0:
+            return None
+
+        for g in gt:
+            if g['ignore'] or (g['area']<(0**2) or g['area']>(1e5**2)):
+                g['_ignore'] = 1
+            else:
+                g['_ignore'] = 0
+
+        # sort dt highest score first, sort gt ignore last
+        gtind = np.argsort([g['_ignore'] for g in gt], kind='mergesort')
+        gt = [gt[i] for i in gtind]
+        dtind = np.argsort([-d['score'] for d in dt], kind='mergesort')
+        dt = [dt[i] for i in dtind[0:p.maxDets[-1]]]
+        iscrowd = [int(o['iscrowd']) for o in gt]
+        # load computed ious
+        ious = self.ious[imgId, catId][:, gtind] if len(self.ious[imgId, catId]) > 0 else self.ious[imgId, catId]
+
+        T = len(p.iouThrs)
+        G = len(gt)
+        D = len(dt)
+        gtm  = np.zeros((T,G))
+        dtm  = np.zeros((T,D))
+        gtIg = np.array([g['_ignore'] for g in gt])
+        dtIg = np.zeros((T,D))
+        if not len(ious)==0:
+            for tind, t in enumerate(p.iouThrs):
+                for dind, d in enumerate(dt):
+                    # information about best match so far (m=-1 -> unmatched)
+                    iou = min([t,1-1e-10])
+                    m   = -1
+                    for gind, g in enumerate(gt):
+                        # if this gt already matched, and not a crowd, continue
+                        if gtm[tind,gind]>0 and not iscrowd[gind]:
+                            continue
+                        # if dt matched to reg gt, and on ignore gt, stop
+                        if m>-1 and gtIg[m]==0 and gtIg[gind]==1:
+                            break
+                        # continue to next gt unless better match made
+                        if ious[dind,gind] < iou:
+                            continue
+                        # if match successful and best so far, store appropriately
+                        iou=ious[dind,gind]
+                        m=gind
+                    # if match made store id of match for both dt and gt
+                    if m ==-1:
+                        continue
+                    dtIg[tind,dind] = gtIg[m]
+                    dtm[tind,dind]  = gt[m]['id']
+                    gtm[tind,m]     = d['id']
+        # set unmatched detections outside of area range to ignore
+        a = np.array([d['area']<(0**2) or d['area']>(1e5**2) for d in dt]).reshape((1, len(dt)))
+        dtIg = np.logical_or(dtIg, np.logical_and(dtm==0, np.repeat(a,T,0)))
+        # store results for given image and category
+        return {
+                'image_id':     imgId,
+                'category_id':  catId,
+                'dtIds':        [d['id'] for d in dt],
+                'gtIds':        [g['id'] for g in gt],
+                'dtMatches':    dtm,
+                'gtMatches':    gtm,
+                'dtScores':     [d['score'] for d in dt],
+                'gtIgnore':     gtIg,
+                'dtIgnore':     dtIg,
+            }
+
+    def my_accumulate(self):
+        '''
+        Self written accumulate function to calculate 
+        Per-category Precision at a particular IoU threshold for detections above a certain confidence threshold
+        '''
+        print('[NIKHIL] Accumulating evaluation results...')
+        tic = time.time()
+        if not self.evalImgs:
+            print('Please run evaluate() first')
+        p = self.params
+        p.catIds = p.catIds if p.useCats == 1 else [-1]
+        T           = len(p.iouThrs)
+        K           = len(p.catIds) if p.useCats else 1
+        S           = len(p.confs)
+        precision   = -np.ones((T,K,S)) # -1 for the precision of absent categories
+
+        # create dictionary for future indexing
+        _pe = self._paramsEval
+        catIds = _pe.catIds if _pe.useCats else [-1]
+        setK = set(catIds)
+        setS = set(_pe.confs)
+        setI = set(_pe.imgIds)
+        # get inds to evaluate
+        k_list = [n for n, k in enumerate(p.catIds)  if k in setK]
+        s_list = [n for n, s in enumerate(p.confs)  if s in setS]
+        i_list = [n for n, i in enumerate(p.imgIds)  if i in setI]
+        I0 = len(_pe.imgIds)
+
+        for k, k0 in enumerate(k_list):
+            Nk = k0*I0
+            for s, s0 in enumerate(s_list):
+                E = [self.evalImgs[Nk + i] for i in i_list]
+                E = [e for e in E if not e is None]
+                if len(E) == 0:
+                    continue
+                dtScores = np.concatenate([e['dtScores'][e['dtScores']>s0] for e in E])
+
+                # different sorting method generates slightly different results.
+                # mergesort is used to be consistent as Matlab implementation.
+                inds = np.argsort(-dtScores, kind='mergesort')
+
+                dtm  = np.concatenate([e['dtMatches'][:,e['dtScores']>s0] for e in E], axis=1)[:,inds]
+                dtIg = np.concatenate([e['dtIgnore'][:,e['dtScores']>s0]  for e in E], axis=1)[:,inds]
+                gtIg = np.concatenate([e['gtIgnore'] for e in E])
+                npig = np.count_nonzero(gtIg==0)
+                if npig == 0:
+                    continue
+                tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
+                fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
+
+                tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
+                fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+
+                for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
+                    tp = np.array(tp)
+                    fp = np.array(fp)
+                    pr = tp / (fp+tp+np.spacing(1))
+                    precision[t,k,s] = pr[-1]
+
+        self.eval = {
+            'params': p,
+            'counts': [T, K, S],
+            'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'precision': precision,
+        }
+
+        toc = time.time()
+        print('[NIKHIL] DONE (t={:0.2f}s).'.format( toc-tic))
+
+
+    def my_summarize(self):
+        '''
+        Compute and display summary metrics for evaluation results.
+        Used for per-category Precision at a particular IoU threshold for detections above a certain confidence threshold.
+        Note this functin can *only* be applied on the default parameter setting.
+        '''
+        def _summarize():
+            print(self.eval['precision'])
+            return self.eval['precision']
+
+        def _summarizeDets():
+            stats = []
+            stats.append(_summarize())
+            return stats
+
+        if not self.eval:
+            raise Exception('Please run accumulate() first')
+        summarize = _summarizeDets
+        self.stats = summarize()
+
+
     def accumulate(self, p = None):
         '''
         Accumulate per image evaluation results and store the result in self.eval
@@ -377,6 +604,12 @@ class COCOeval:
 
                     tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
                     fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+
+                    # Nikhil
+                    print("Shapes 1 ===== ")
+                    print(tp_sum.shape)
+                    print(fp_sum.shape)
+
                     for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
                         tp = np.array(tp)
                         fp = np.array(fp)
@@ -499,6 +732,14 @@ class Params:
     '''
     Params for coco evaluation api
     '''
+    def my_setDetParams(self):
+        self.imgIds = []
+        self.catIds = []
+        self.iouThrs = [0.2, 0.3, 0.5, 0.75, 0.9]
+        self.confs = [0.5, 0.7, 0.9]
+        self.maxDets = [10000]
+        self.useCats = 1
+
     def setDetParams(self):
         self.imgIds = []
         self.catIds = []
@@ -524,7 +765,8 @@ class Params:
 
     def __init__(self, iouType='segm'):
         if iouType == 'segm' or iouType == 'bbox':
-            self.setDetParams()
+            # self.setDetParams()
+            self.my_setDetParams()
         elif iouType == 'keypoints':
             self.setKpParams()
         else:
