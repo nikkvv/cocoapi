@@ -117,10 +117,10 @@ class COCOeval:
             self._dts[dt['image_id'], dt['category_id']].append(dt)
 
         # Nikhil
-        print("GTS=============")
-        print(self._gts)
-        print("DTS=============")
-        print(self._dts)
+        # print("GTS=============")
+        # print(self._gts)
+        # print("DTS=============")
+        # print(self._dts)
 
         self.evalImgs = defaultdict(list)   # per-image per-category evaluation results
         self.eval     = {}                  # accumulated evaluation results
@@ -158,8 +158,8 @@ class COCOeval:
                         for imgId in p.imgIds
                         for catId in catIds}
 
-        print("IOUs============")
-        print(self.ious)
+        # print("IOUs============")
+        # print(self.ious)
 
         evaluateImg = self.my_evaluateImg
         maxDet = p.maxDets[-1]
@@ -168,8 +168,8 @@ class COCOeval:
                  for imgId in p.imgIds
              ]
 
-        print("EvalImgs============")
-        print(self.evalImgs)
+        # print("EvalImgs============")
+        # print(self.evalImgs)
 
         self._paramsEval = copy.deepcopy(self.params)
         toc = time.time()
@@ -463,6 +463,7 @@ class COCOeval:
         K           = len(p.catIds) if p.useCats else 1
         S           = len(p.confs)
         precision   = -np.ones((T,K,S)) # -1 for the precision of absent categories
+        recall      = -np.ones((T,K,S))
 
         # create dictionary for future indexing
         _pe = self._paramsEval
@@ -483,14 +484,15 @@ class COCOeval:
                 E = [e for e in E if not e is None]
                 if len(E) == 0:
                     continue
-                dtScores = np.concatenate([e['dtScores'][e['dtScores']>s0] for e in E])
+
+                dtScores = np.concatenate([np.array(e['dtScores'])[np.asarray(e['dtScores'], dtype=np.float32)>p.confs[s0]] for e in E])
 
                 # different sorting method generates slightly different results.
                 # mergesort is used to be consistent as Matlab implementation.
                 inds = np.argsort(-dtScores, kind='mergesort')
 
-                dtm  = np.concatenate([e['dtMatches'][:,e['dtScores']>s0] for e in E], axis=1)[:,inds]
-                dtIg = np.concatenate([e['dtIgnore'][:,e['dtScores']>s0]  for e in E], axis=1)[:,inds]
+                dtm  = np.concatenate([np.array(e['dtMatches'])[:,np.asarray(e['dtScores'], dtype=np.float32)>p.confs[s0]] for e in E], axis=1)[:,inds]
+                dtIg = np.concatenate([np.array(e['dtIgnore'])[:,np.asarray(e['dtScores'], dtype=np.float32)>p.confs[s0]]  for e in E], axis=1)[:,inds]
                 gtIg = np.concatenate([e['gtIgnore'] for e in E])
                 npig = np.count_nonzero(gtIg==0)
                 if npig == 0:
@@ -501,17 +503,25 @@ class COCOeval:
                 tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
                 fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
 
+                # print(tp_sum.shape)
+                # print(fp_sum.shape)
+                if tp_sum.shape[1]==0:
+                    continue
+
                 for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
                     tp = np.array(tp)
                     fp = np.array(fp)
                     pr = tp / (fp+tp+np.spacing(1))
+                    rc = tp / npig
                     precision[t,k,s] = pr[-1]
+                    recall[t,k,s] = rc[-1]
 
         self.eval = {
             'params': p,
             'counts': [T, K, S],
             'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'precision': precision,
+            'precision': np.transpose(precision, (1, 0, 2)),
+            'recall': np.transpose(recall, (1, 0, 2))
         }
 
         toc = time.time()
@@ -524,17 +534,53 @@ class COCOeval:
         Used for per-category Precision at a particular IoU threshold for detections above a certain confidence threshold.
         Note this functin can *only* be applied on the default parameter setting.
         '''
-        def _summarize():
-            print(self.eval['precision'])
-            return self.eval['precision']
+        def _summarize(ap=1, iouThr=None, confThr=None):
+            p = self.params
+            iStr = '.{:<18} {} @[ IoU={:0.2f} | Conf={:0.2f} ] = {:0.3f}'
+            titleStr = 'Precision' if ap == 1 else 'Recall'
+            typeStr = '(AP)' if ap == 1 else '(AR)'
+
+            iou_ind = [i for i, iou in enumerate(p.iouThrs) if iou == iouThr]
+            conf_ind = [i for i, conf in enumerate(p.confs) if conf == confThr]
+
+            if ap == 1:
+                # dimension of precision: [KxTxS]
+                s = self.eval['precision']
+            else:
+                # dimension of recall: [KxTxS]
+                s = self.eval['recall']
+            
+            s = s[:, iou_ind, conf_ind]
+            if len(s[s>-1])==0:
+                mean_s = -1
+            else:
+                mean_s = np.mean(s[s>-1])
+
+            print(iStr.format(titleStr, typeStr, iouThr, confThr, mean_s))
+            return mean_s
 
         def _summarizeDets():
-            stats = []
-            stats.append(_summarize())
+            stats = np.zeros((12,))
+            stats[0] = _summarize(1, iouThr=.2, confThr=.5)
+            stats[1] = _summarize(1, iouThr=.3, confThr=.5)
+            stats[2] = _summarize(1, iouThr=.5, confThr=.5)
+            stats[3] = _summarize(1, iouThr=.2, confThr=.7)
+            stats[4] = _summarize(1, iouThr=.3, confThr=.7)
+            stats[5] = _summarize(1, iouThr=.5, confThr=.7)
+            stats[6] = _summarize(0, iouThr=.2, confThr=.5)
+            stats[7] = _summarize(0, iouThr=.3, confThr=.5)
+            stats[8] = _summarize(0, iouThr=.5, confThr=.5)
+            stats[9] = _summarize(0, iouThr=.2, confThr=.7)
+            stats[10] = _summarize(0, iouThr=.3, confThr=.7)
+            stats[11] = _summarize(0, iouThr=.5, confThr=.7)
             return stats
 
         if not self.eval:
             raise Exception('Please run accumulate() first')
+        print("Precision =====")
+        print(self.eval['precision'])
+        print("Recall =====")
+        print(self.eval['recall'])
         summarize = _summarizeDets
         self.stats = summarize()
 
@@ -606,9 +652,9 @@ class COCOeval:
                     fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
 
                     # Nikhil
-                    print("Shapes 1 ===== ")
-                    print(tp_sum.shape)
-                    print(fp_sum.shape)
+                    # print("Shapes 1 ===== ")
+                    # print(tp_sum.shape)
+                    # print(fp_sum.shape)
 
                     for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
                         tp = np.array(tp)
@@ -736,7 +782,7 @@ class Params:
         self.imgIds = []
         self.catIds = []
         self.iouThrs = [0.2, 0.3, 0.5, 0.75, 0.9]
-        self.confs = [0.5, 0.7, 0.9]
+        self.confs = [0.05, 0.1, 0.25, 0.5, 0.7, 0.9]
         self.maxDets = [10000]
         self.useCats = 1
 
